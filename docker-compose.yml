@@ -1,0 +1,59 @@
+version: "3.9"
+
+services:
+
+  # -----------------------------------------------------------------------
+  # NATS: broker de mensajería. JetStream desactivado por ahora — para SSE
+  # el pub/sub clásico es suficiente y más liviano.
+  # -----------------------------------------------------------------------
+  nats:
+    image: nats:2.10-alpine
+    container_name: arecibo-nats
+    ports:
+      - "4222:4222"   # puerto de clientes
+      - "8222:8222"   # puerto de monitoreo HTTP
+    command: ["--http_port", "8222"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # -----------------------------------------------------------------------
+  # Publisher API: recibe peticiones HTTP y las publica en NATS.
+  # Depende de NATS para no arrancar en seco.
+  # -----------------------------------------------------------------------
+  publisher:
+    build:
+      context: ./services/publisher
+      dockerfile: Dockerfile
+    container_name: arecibo-publisher
+    ports:
+      - "8080:8080"
+    environment:
+      - NATS_URL=nats://nats:4222
+      - PORT=8080
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # -----------------------------------------------------------------------
+  # SSE Gateway: suscribe a NATS y mantiene conexiones SSE con los clientes.
+  # Es el servicio más crítico en términos de concurrencia.
+  # -----------------------------------------------------------------------
+  gateway:
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    container_name: arecibo-gateway
+    ports:
+      - "8081:8081"
+    environment:
+      - NATS_URL=nats://nats:4222
+      - PORT=8081
+    depends_on:
+      nats:
+        condition: service_healthy
+    restart: unless-stopped
