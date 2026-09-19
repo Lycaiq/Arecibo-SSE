@@ -3,10 +3,12 @@ package sse
 import (
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/arecibo-sse/gateway/internal/middleware"
 )
 
 // keepAliveInterval define cada cuánto mandamos un comentario SSE de keepalive.
@@ -35,18 +37,19 @@ func NewHandler(s Subscriber, allowedOrigin string) *Handler {
 
 // ServeHTTP maneja GET /subscribe?topic=<topic>.
 //
-// Flujo de vida de una conexión:
-//   1. Validamos que el ResponseWriter soporte flush (necesario para SSE).
-//   2. Validamos y sanitizamos el topic.
-//   3. Escribimos las cabeceras SSE y hacemos el primer flush.
-//   4. Creamos la suscripción NATS y registramos su cancelación con defer.
-//   5. Loop: escuchamos mensajes, keepalive o desconexión del cliente.
-//   6. Al salir del loop (por cualquier causa), el defer cancela la suscripción.
+// Cada conexión SSE tiene su propio X-Request-ID para poder seguir todo su ciclo
+// de vida en los logs: apertura, mensajes enviados, duración y causa de cierre.
 //
-// El defer de cancelación en el paso 4 es la pieza crítica de este servicio.
-// Sin él, cada cliente que se desconecta dejaría una goroutine y una suscripción NATS
-// viva para siempre — un memory leak que escala linealmente con el tráfico.
+// Flujo de vida de una conexión:
+//   1. Extraemos el request ID del contexto (inyectado por el middleware).
+//   2. Validamos flusher y topic.
+//   3. Suscribimos a NATS y registramos el defer de cancelación.
+//   4. Logueamos "conectado" con el request ID.
+//   5. Loop: mensajes, keepalive o ctx.Done().
+//   6. El defer loguea "desconectado" con duración y total de mensajes enviados.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	reqID := middleware.FromContext(r.Context())
+
 	// Solo GET tiene sentido para SSE.
 	if r.Method != http.MethodGet {
 		http.Error(w, `{"error":"método no permitido"}`, http.StatusMethodNotAllowed)
@@ -54,7 +57,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// SSE requiere que el ResponseWriter pueda hacer flush inmediato.
-	// Si no lo soporta (ej. algunos middlewares de compresión), no podemos continuar.
+	// El loggingWriter del middleware también implementa Flusher, así que este check no falla.
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, `{"error":"streaming no soportado por este servidor"}`, http.StatusInternalServerError)
@@ -68,27 +71,42 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cabeceras SSE estándar.
-	// X-Accel-Buffering: no → deshabilita el buffering de nginx para esta respuesta.
-	// Sin esto, nginx acumula el stream y los clientes no ven nada hasta que el buffer se llene.
 	h.setSSEHeaders(w)
 
 	// Suscribimos a NATS antes de escribir nada en el body.
 	// Si falla aquí podemos devolver un error HTTP normal todavía.
 	msgCh, cancel, err := h.subscriber.Subscribe(topic)
 	if err != nil {
-		log.Printf("sse: error suscribiendo a %q: %v", topic, err)
+		slog.Error("sse: error suscribiendo",
+			"request_id", reqID,
+			"topic", topic,
+			"error", err,
+		)
 		http.Error(w, `{"error":"error al suscribirse al topic"}`, http.StatusInternalServerError)
 		return
 	}
 
+	connectedAt := time.Now()
+	var msgsSent int64
+
 	// CRÍTICO: cancel se llama siempre al salir, sin importar cómo termine la función.
-	// Cubre: desconexión del cliente, error de escritura, panic (con recover en el mux), timeout.
+	// El log de desconexión incluye duración y mensajes enviados para auditoría.
 	defer func() {
 		cancel()
-		log.Printf("sse: cliente desconectado de %q (remote: %s)", topic, r.RemoteAddr)
+		slog.Info("sse: cliente desconectado",
+			"request_id", reqID,
+			"topic", topic,
+			"remote", r.RemoteAddr,
+			"msgs_sent", msgsSent,
+			"duration", time.Since(connectedAt).Round(time.Millisecond).String(),
+		)
 	}()
 
-	log.Printf("sse: cliente conectado a %q (remote: %s)", topic, r.RemoteAddr)
+	slog.Info("sse: cliente conectado",
+		"request_id", reqID,
+		"topic", topic,
+		"remote", r.RemoteAddr,
+	)
 
 	// Primer flush: confirma al browser que la conexión SSE está establecida.
 	// Sin esto, algunos browsers esperan datos antes de disparar el evento `open` del EventSource.
@@ -111,7 +129,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case data, ok := <-msgCh:
 			if !ok {
 				// El canal fue cerrado desde el broker — situación anormal, salimos limpiamente.
-				log.Printf("sse: canal cerrado inesperadamente para topic %q", topic)
+				slog.Warn("sse: canal cerrado inesperadamente",
+					"request_id", reqID,
+					"topic", topic,
+				)
 				return
 			}
 
@@ -119,16 +140,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// El doble salto de línea marca el fin del evento y dispara el listener en el browser.
 			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
 				// Si no podemos escribir, el cliente ya se fue. Dejamos que el defer limpie.
-				log.Printf("sse: error escribiendo a cliente en %q: %v", topic, err)
+				slog.Warn("sse: error escribiendo al cliente",
+					"request_id", reqID,
+					"topic", topic,
+					"error", err,
+				)
 				return
 			}
 			flusher.Flush()
+			msgsSent++
 
 		case <-keepAlive.C:
 			// Comentario SSE: el browser lo ignora pero mantiene la conexión TCP viva
 			// y nos permite detectar clientes desconectados (el write fallará si el cliente se fue).
 			if _, err := fmt.Fprintf(w, ": keepalive\n\n"); err != nil {
-				log.Printf("sse: cliente muerto detectado en keepalive para %q: %v", topic, err)
+				slog.Warn("sse: cliente muerto detectado en keepalive",
+					"request_id", reqID,
+					"topic", topic,
+					"error", err,
+				)
 				return
 			}
 			flusher.Flush()
@@ -159,7 +189,6 @@ type healthResponse struct {
 }
 
 // HealthHandler devuelve el estado del servicio.
-// Puede extenderse para verificar la conexión NATS en el futuro.
 func HealthHandler(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

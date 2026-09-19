@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -14,34 +14,45 @@ import (
 	"github.com/arecibo-sse/publisher/internal/broker"
 	"github.com/arecibo-sse/publisher/internal/config"
 	"github.com/arecibo-sse/publisher/internal/handler"
+	"github.com/arecibo-sse/publisher/internal/middleware"
 )
 
 func main() {
+	// Configuramos slog con formato texto para desarrollo.
+	// En producción bastaría cambiar a slog.NewJSONHandler para ingestion en Loki/Datadog/etc.
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		slog.Error("cargando config", "error", err)
+		os.Exit(1)
 	}
 
 	// Conectamos a NATS antes de levantar el HTTP server.
 	// No tiene sentido aceptar peticiones si no hay donde publicarlas.
 	natsClient, err := broker.New(cfg.NatsURL)
 	if err != nil {
-		log.Fatalf("nats: %v", err)
+		slog.Error("conectando a nats", "url", cfg.NatsURL, "error", err)
+		os.Exit(1)
 	}
 	defer natsClient.Close()
 
-	log.Printf("nats: conectado a %s", cfg.NatsURL)
+	slog.Info("nats conectado", "url", cfg.NatsURL)
 
 	// Registramos rutas en el mux de la librería estándar.
-	// Para dos endpoints no justificamos traer un router externo.
 	mux := http.NewServeMux()
-
 	mux.Handle("POST /publish", handler.NewPublishHandler(natsClient))
 	mux.HandleFunc("GET /health", healthHandler)
 
+	// Cadena de middleware: RequestID primero para que Logger ya tenga el ID disponible.
+	// El orden importa: RequestID → Logger → Mux (manejadores reales).
+	chain := middleware.RequestID(middleware.Logger(mux))
+
 	server := &http.Server{
 		Addr:    cfg.Addr(),
-		Handler: mux,
+		Handler: chain,
 
 		// Timeouts explícitos para evitar goroutines colgadas por conexiones lentas.
 		ReadTimeout:  5 * time.Second,
@@ -54,25 +65,27 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("publisher: escuchando en %s", cfg.Addr())
+		slog.Info("publisher escuchando", "addr", cfg.Addr())
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http: %v", err)
+			slog.Error("servidor http caído", "error", err)
+			os.Exit(1)
 		}
 	}()
 
 	// Bloqueamos hasta recibir señal de parada.
-	<-quit
-	log.Println("publisher: señal recibida, apagando...")
+	sig := <-quit
+	slog.Info("señal recibida, apagando", "signal", sig.String())
 
 	// 10 segundos para terminar las conexiones activas antes de forzar el cierre.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("publisher: shutdown forzado: %v", err)
+		slog.Error("shutdown forzado", "error", err)
+		os.Exit(1)
 	}
 
-	log.Println("publisher: apagado limpio")
+	slog.Info("publisher apagado limpiamente")
 }
 
 // healthHandler es un liveness probe simple para Docker y orquestadores.

@@ -2,10 +2,12 @@ package handler
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/arecibo-sse/publisher/internal/middleware"
 )
 
 // Publisher define la interfaz mínima que necesita el handler para operar.
@@ -47,6 +49,8 @@ func NewPublishHandler(p Publisher) *PublishHandler {
 
 // ServeHTTP implementa http.Handler directamente para no necesitar un router externo.
 func (h *PublishHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	reqID := middleware.FromContext(r.Context())
+
 	if r.Method != http.MethodPost {
 		http.Error(w, `{"error":"método no permitido"}`, http.StatusMethodNotAllowed)
 		return
@@ -78,10 +82,19 @@ func (h *PublishHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.publisher.Publish(req.Topic, event); err != nil {
-		log.Printf("handler: error publicando en %q: %v", req.Topic, err)
+		slog.Error("error publicando en nats",
+			"request_id", reqID,
+			"topic", req.Topic,
+			"error", err,
+		)
 		http.Error(w, `{"error":"error al publicar el evento"}`, http.StatusInternalServerError)
 		return
 	}
+
+	slog.Info("evento publicado",
+		"request_id", reqID,
+		"topic", req.Topic,
+	)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)

@@ -2,7 +2,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,23 +11,32 @@ import (
 
 	"github.com/arecibo-sse/gateway/internal/broker"
 	"github.com/arecibo-sse/gateway/internal/config"
+	"github.com/arecibo-sse/gateway/internal/middleware"
 	"github.com/arecibo-sse/gateway/internal/sse"
 )
 
 func main() {
+	// Mismo formato de logs que el publisher — facilita unificar ambos streams
+	// en herramientas como Loki, Datadog o cualquier agregador que parsee texto.
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
 	cfg, err := config.Load()
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		slog.Error("cargando config", "error", err)
+		os.Exit(1)
 	}
 
 	// Conectamos a NATS antes de aceptar conexiones SSE.
 	natsClient, err := broker.New(cfg.NatsURL)
 	if err != nil {
-		log.Fatalf("nats: %v", err)
+		slog.Error("conectando a nats", "url", cfg.NatsURL, "error", err)
+		os.Exit(1)
 	}
 	defer natsClient.Close()
 
-	log.Printf("nats: conectado a %s", cfg.NatsURL)
+	slog.Info("nats conectado", "url", cfg.NatsURL)
 
 	// Construimos el handler SSE con el cliente NATS inyectado.
 	sseHandler := sse.NewHandler(natsClient, cfg.AllowedOrigin)
@@ -38,19 +47,23 @@ func main() {
 	mux.Handle("GET /subscribe", sseHandler)
 
 	// Preflight CORS para browsers que mandan OPTIONS antes del EventSource.
-	// En la práctica EventSource solo usa GET, pero algunos proxies lo transforman.
 	mux.HandleFunc("OPTIONS /subscribe", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", cfg.AllowedOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Cache-Control")
+		w.Header().Set("Access-Control-Allow-Headers", "Cache-Control, X-Request-ID")
 		w.WriteHeader(http.StatusNoContent)
 	})
 
 	mux.HandleFunc("GET /health", sse.HealthHandler)
 
+	// Cadena de middleware: RequestID → Logger → Mux.
+	// El Logger loguea "completado" cuando el handler SSE termina (cliente desconectado),
+	// lo que nos da la duración real de cada sesión SSE en los logs del middleware.
+	chain := middleware.RequestID(middleware.Logger(mux))
+
 	server := &http.Server{
 		Addr:    cfg.Addr(),
-		Handler: mux,
+		Handler: chain,
 
 		// ReadTimeout bajo porque una vez establecido el stream no hay más reads del cliente.
 		ReadTimeout: 5 * time.Second,
@@ -66,23 +79,24 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("gateway: escuchando en %s", cfg.Addr())
+		slog.Info("gateway escuchando", "addr", cfg.Addr())
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http: %v", err)
+			slog.Error("servidor http caído", "error", err)
+			os.Exit(1)
 		}
 	}()
 
-	<-quit
-	log.Println("gateway: señal recibida, apagando...")
+	sig := <-quit
+	slog.Info("señal recibida, apagando", "signal", sig.String())
 
 	// 30s de gracia para que los clientes SSE activos reciban un cierre limpio.
-	// Es más que el publisher porque las conexiones SSE son de larga duración.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Fatalf("gateway: shutdown forzado: %v", err)
+		slog.Error("shutdown forzado", "error", err)
+		os.Exit(1)
 	}
 
-	log.Println("gateway: apagado limpio")
+	slog.Info("gateway apagado limpiamente")
 }
