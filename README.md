@@ -512,10 +512,16 @@ http.Post("http://localhost:8080/publish", "application/json",
 Para producción, considera:
 
 1. **CORS**: cambia `ALLOWED_ORIGIN=*` al dominio real.
-2. **nginx**: agrega `proxy_buffering off` y `proxy_read_timeout 3600s` para SSE.
-3. **Load balancing**: SSE requiere sticky sessions o un broker compartido (NATS ya lo es).
-4. **Escala horizontal del gateway**: múltiples instancias pueden compartir el mismo NATS.
-5. **TLS**: termina TLS en nginx o un ingress; los servicios Go no necesitan cambios.
+2. **nginx / ALB**: requieren configuración específica para no cortar conexiones SSE. Ver guía completa abajo.
+3. **Load balancing**: gracias a NATS, **no se necesitan sticky sessions**. Cualquier instancia del gateway atiende a cualquier cliente.
+4. **Escala horizontal del gateway**: añadir instancias solo requiere que se conecten a NATS. El fan-out lo hace NATS.
+5. **TLS**: termina TLS en nginx, ALB o CloudFront; los servicios Go no necesitan cambios.
+
+📖 **[Guía completa de escalado en AWS con ALB →](docs/aws-scaling.md)**
+
+Cubre: idle timeout, deregistration delay, sticky sessions, NATS en AWS, CloudFront, security groups y checklist de producción.
+
+---
 
 Ejemplo de configuración nginx para SSE:
 
