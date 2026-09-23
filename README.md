@@ -30,12 +30,52 @@ Arecibo-SSE resuelve el problema de enviar notificaciones del servidor al navega
 
 ---
 
-## SSE vs WebSockets — ¿Por qué SSE?
+## ¿Qué es SSE?
+
+**Server-Sent Events** es una tecnología web estándar (parte de HTML5) que permite al servidor enviar datos al navegador a través de una conexión HTTP normal que se mantiene abierta.
+
+La idea es simple: el browser hace un `GET` y en lugar de recibir una respuesta completa y cerrar la conexión, la deja abierta indefinidamente. El servidor va escribiendo datos en esa conexión a medida que ocurren eventos, y el browser los procesa en tiempo real.
+
+### Cómo funciona en el navegador
+
+El browser tiene una API nativa llamada `EventSource` que abstrae todo esto:
+
+```javascript
+// El browser abre una conexión HTTP y la mantiene viva
+const es = new EventSource('/subscribe?topic=alerts');
+
+// Cada vez que el servidor envía un evento, esta función se ejecuta
+es.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log('Nuevo evento:', data);
+};
+
+// Si la conexión se corta (red inestable, servidor reiniciado),
+// el browser reconecta automáticamente. Sin código extra.
+es.onerror = (err) => {
+  console.log('Reconectando...');
+};
+```
+
+El formato que viaja por la red es texto plano muy simple:
+
+```
+data: {"topic":"alerts","data":{"msg":"servidor caído"},"timestamp":"2026-09-22T03:00:00Z"}
+
+data: {"topic":"alerts","data":{"msg":"servidor recuperado"},"timestamp":"2026-09-22T03:01:00Z"}
+
+: keepalive
+
+```
+
+Cada evento es una línea que empieza con `data:`, seguida de una línea en blanco que marca el fin del evento. Los comentarios (líneas con `:`) son ignorados por el browser pero mantienen la conexión TCP activa.
+
+### SSE vs WebSockets — ¿Por qué SSE?
 
 | Característica | SSE | WebSockets |
 |---|---|---|
 | **Dirección** | Servidor → Cliente | Bidireccional |
-| **Protocolo** | HTTP/1.1 y HTTP/2 | Upgrade a WS |
+| **Protocolo** | HTTP/1.1 y HTTP/2 nativo | Upgrade a protocolo WS |
 | **Reconexión** | Automática (built-in) | Manual |
 | **Infraestructura** | Funciona con nginx, CDN, proxies estándar | Requiere soporte WS explícito |
 | **Complejidad** | Baja — es HTTP normal | Alta — nuevo protocolo |
