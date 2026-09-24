@@ -84,6 +84,119 @@ Cada evento es una línea que empieza con `data:`, seguida de una línea en blan
 
 **SSE es la elección correcta cuando el servidor habla y el cliente escucha.** Para Arecibo-SSE, donde los eventos solo fluyen del backend al browser, SSE elimina complejidad sin sacrificar capacidad.
 
+### SSE como fallback cuando WebSocket falla
+
+Hay entornos donde WebSocket simplemente no funciona:
+
+- **Proxies corporativos** — muchos proxies HTTP de empresas bloquean o transforman el `Upgrade: websocket` y rompen el handshake silenciosamente.
+- **Infraestructura vieja** — algunos CDNs, balanceadores o firewalls no soportan WS y cierran la conexión sin avisar.
+- **Redes restrictivas** — en hoteles, aeropuertos o VPNs, los puertos 80/443 funcionan pero WS falla.
+
+En todos esos casos el frontend puede degradar a SSE para seguir recibiendo notificaciones, aunque pierda la capacidad bidireccional. Para un sistema de notificaciones (servidor → cliente) eso es suficiente — el usuario sigue recibiendo alertas sin notar nada.
+
+**Flujo de decisión en el cliente:**
+
+```
+Frontend arranca
+       │
+       ▼
+Intenta conectar WebSocket (ws://...)
+       │
+   ¿Conectó? ──── Sí ──▶ Usa WebSocket normalmente
+       │
+      No (error / timeout)
+       │
+       ▼
+Fallback: abre EventSource (GET /subscribe?topic=...)
+       │
+   ¿Conectó? ──── Sí ──▶ Recibe notificaciones vía SSE
+       │                  (solo lectura, sin envío desde el cliente)
+      No
+       │
+       ▼
+Muestra error de conectividad al usuario
+```
+
+**Ejemplo de implementación del patrón fallback:**
+
+```typescript
+// hooks/useRealtimeNotifications.ts
+//
+// Intenta WebSocket primero. Si falla en los primeros 3 segundos,
+// cae automáticamente a SSE para seguir recibiendo eventos del servidor.
+
+import { useEffect, useState } from 'react';
+
+type Transport = 'websocket' | 'sse' | 'error' | 'connecting';
+
+export function useRealtimeNotifications(topic: string) {
+  const [messages, setMessages]   = useState<unknown[]>([]);
+  const [transport, setTransport] = useState<Transport>('connecting');
+
+  useEffect(() => {
+    let ws: WebSocket | null = null;
+    let es: EventSource | null = null;
+    // Si WebSocket no levanta en 3s, asumimos que el entorno lo bloquea.
+    const wsTimeout = setTimeout(() => fallbackToSSE(), 3000);
+
+    function handleMessage(data: string) {
+      try {
+        setMessages(prev => [JSON.parse(data), ...prev].slice(0, 100));
+      } catch { /* mensaje no-JSON, ignorar */ }
+    }
+
+    function fallbackToSSE() {
+      ws?.close();
+      es = new EventSource(`/subscribe?topic=${topic}`);
+      es.onopen    = () => setTransport('sse');
+      es.onmessage = (e) => handleMessage(e.data);
+      es.onerror   = () => setTransport('error');
+    }
+
+    // --- Intento 1: WebSocket ---
+    try {
+      ws = new WebSocket(`wss://${location.host}/ws?topic=${topic}`);
+
+      ws.onopen = () => {
+        clearTimeout(wsTimeout); // WS funcionó, cancelamos el fallback
+        setTransport('websocket');
+      };
+
+      ws.onmessage = (e) => handleMessage(e.data);
+
+      ws.onerror = () => {
+        clearTimeout(wsTimeout);
+        fallbackToSSE(); // fallo inmediato → SSE ahora
+      };
+    } catch {
+      // WebSocket no disponible (ej. HTTP sin TLS en producción)
+      clearTimeout(wsTimeout);
+      fallbackToSSE();
+    }
+
+    return () => {
+      clearTimeout(wsTimeout);
+      ws?.close();
+      es?.close();
+    };
+  }, [topic]);
+
+  return { messages, transport };
+}
+```
+
+En el componente, el `transport` permite mostrarle al usuario qué conexión está activa — útil para depuración o para informar en entornos donde WS no funciona:
+
+```tsx
+const { messages, transport } = useRealtimeNotifications('alerts.critical');
+
+// transport === 'websocket' → conexión completa
+// transport === 'sse'       → modo lectura, notificaciones funcionando
+// transport === 'error'     → sin conexión
+```
+
+> **Nota de diseño**: este patrón es relevante cuando tu backend tiene WebSocket para envío bidireccional (ej. el usuario puede responder o interactuar desde el frontend) pero quieres garantizar que al menos las notificaciones lleguen en cualquier red. Si tu caso de uso es solo recibir datos del servidor — como en Arecibo-SSE — SSE directamente es la solución más simple y no necesitas el fallback.
+
 ---
 
 ## Arquitectura detallada
